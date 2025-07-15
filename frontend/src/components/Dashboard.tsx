@@ -1,5 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import { Upload, FileText, MessageSquare, Trash2, LogOut, Plus, Search, Link } from 'lucide-react';
+import { Sun, Moon } from 'lucide-react';
 import { logout } from '../utils/auth';
 import { User } from '../utils/auth';
 // import { Document, getDocuments, deleteDocument } from '../utils/storage';
@@ -28,6 +29,14 @@ export const Dashboard: React.FC<DashboardProps> = ({ user, onLogout }) => {
   const [linkInput, setLinkInput] = useState('');
   const [linkError, setLinkError] = useState('');
   const [linkLoading, setLinkLoading] = useState(false);
+  const [theme, setTheme] = useState<'light' | 'dark'>(
+    localStorage.getItem('theme') === 'dark' ? 'dark' : 'light'
+  );
+
+  useEffect(() => {
+    document.documentElement.classList.toggle('dark', theme === 'dark');
+    localStorage.setItem('theme', theme);
+  }, [theme]);
 
   useEffect(() => {
     loadDocuments();
@@ -165,26 +174,37 @@ export const Dashboard: React.FC<DashboardProps> = ({ user, onLogout }) => {
         document={selectedDocument}
         onBack={() => setSelectedDocument(null)}
         onDelete={() => handleDeleteDocument(selectedDocument.id)}
+        documents={documents}
+        onDocumentSwitch={doc => setSelectedDocument(doc)}
       />
     );
   }
 
   return (
-    <div className="min-h-screen bg-gradient-to-br from-blue-50 via-purple-50 to-teal-50">
+    <div className="min-h-screen bg-gradient-to-br from-blue-50 via-purple-50 to-teal-50 dark:bg-gradient-to-br dark:from-gray-900 dark:via-gray-800 dark:to-gray-900">
       <div className="max-w-6xl mx-auto p-6">
         {/* Header */}
         <div className="flex items-center justify-between mb-8">
           <div>
-            <h1 className="text-3xl font-bold text-gray-900">Document Chat Assistant</h1>
-            <p className="text-gray-600 mt-1">Welcome back, {user.email}</p>
+            <h1 className="text-3xl font-bold text-gray-900 dark:text-white">Document Chat Assistant</h1>
+            <p className="text-gray-600 dark:text-gray-300 mt-1">Welcome back, {user.email}</p>
           </div>
-          <button
-            onClick={handleLogout}
-            className="flex items-center gap-2 px-4 py-2 text-gray-600 hover:text-gray-900 hover:bg-white/50 rounded-lg transition-colors"
-          >
-            <LogOut className="w-5 h-5" />
-            Logout
-          </button>
+          <div className="flex items-center gap-4">
+            <button
+              onClick={() => setTheme(theme === 'dark' ? 'light' : 'dark')}
+              className="p-2 rounded-lg border border-gray-300 dark:border-gray-700 bg-white dark:bg-gray-800 text-gray-600 dark:text-gray-200 hover:bg-gray-100 dark:hover:bg-gray-700 transition-colors"
+              title={theme === 'dark' ? 'Switch to light mode' : 'Switch to dark mode'}
+            >
+              {theme === 'dark' ? <Sun className="w-5 h-5" /> : <Moon className="w-5 h-5" />}
+            </button>
+            <button
+              onClick={handleLogout}
+              className="flex items-center gap-2 px-4 py-2 text-gray-600 dark:text-gray-200 hover:text-gray-900 dark:hover:text-white hover:bg-white/50 dark:hover:bg-gray-700 rounded-lg transition-colors"
+            >
+              <LogOut className="w-5 h-5" />
+              Logout
+            </button>
+          </div>
         </div>
 
         {/* Upload Section */}

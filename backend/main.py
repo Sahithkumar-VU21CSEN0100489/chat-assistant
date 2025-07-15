@@ -20,7 +20,10 @@ from sentence_transformers import SentenceTransformer
 from sklearn.metrics.pairwise import cosine_similarity
 import requests
 from bs4 import BeautifulSoup
-from readability import Document as ReadabilityDocument
+try:
+    from readability import Document as ReadabilityDocument
+except ImportError:
+    ReadabilityDocument = None
 import random
 import smtplib
 from email.mime.text import MIMEText
@@ -149,6 +152,7 @@ def reset_password(req: ResetPasswordRequest, db: Session = Depends(get_db)):
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
     user.hashed_password = auth.get_password_hash(new_password)
+    db.add(user)
     db.commit()
     del otp_store[email]
     subject = "OTP for Password Reset - Document Chat Assistant"
@@ -178,10 +182,13 @@ def upload_document(
             print("[DEBUG] User not found in DB")
             raise HTTPException(status_code=401, detail="Invalid user")
         # Restrict to 3 documents per user
-        user_id = int(user.id)
+        user_id = user.id  # user.id is already the correct type for DB queries
         user_documents = crud.get_documents_by_user(db, user_id)
         if len(user_documents) >= 3:
-            raise HTTPException(status_code=400, detail="You can only upload up to 3 documents. Delete existing documents to upload new ones.")
+            raise HTTPException(
+                status_code=400,
+                detail="You can only upload up to 3 documents. Delete existing documents to upload new ones."
+            )
         content = None
         print(f"[DEBUG] File content type: {file.content_type}")
         if file.content_type == "text/plain":
@@ -189,7 +196,6 @@ def upload_document(
             try:
                 content = file.file.read().decode("utf-8")
             except UnicodeDecodeError:
-                # Try with different encodings if UTF-8 fails
                 file.file.seek(0)  # Reset file pointer
                 try:
                     content = file.file.read().decode("latin-1")
@@ -201,12 +207,31 @@ def upload_document(
             print("Processing PDF file")
             reader = PyPDF2.PdfReader(file.file)
             content = "\n".join(page.extract_text() or "" for page in reader.pages)
-            print("Finished PDF file")
+            # --- Table Extraction for PDF ---
+            tables = []
+            for page in reader.pages:
+                text = page.extract_text() or ""
+                # Simple heuristic: look for lines with multiple columns separated by spaces/tabs
+                lines = text.split("\n")
+                for line in lines:
+                    if "\t" in line or (line.count(" ") > 5):
+                        tables.append(line)
+            if tables:
+                content += "\n\n[Extracted Tables from PDF]\n" + "\n".join(tables)
+            print("Finished PDF file with table extraction")
         elif file.content_type == "application/vnd.openxmlformats-officedocument.wordprocessingml.document":
             print("Processing DOCX file")
             docx_file = docx.Document(file.file)
             content = "\n".join([para.text for para in docx_file.paragraphs])
-            print("Finished DOCX file")
+            # --- Table Extraction for DOCX ---
+            docx_tables = []
+            for table in docx_file.tables:
+                for row in table.rows:
+                    row_text = [cell.text.strip() for cell in row.cells]
+                    docx_tables.append(" | ".join(row_text))
+            if docx_tables:
+                content += "\n\n[Extracted Tables from DOCX]\n" + "\n".join(docx_tables)
+            print("Finished DOCX file with table extraction")
         else:
             print("Unsupported file type:", file.content_type)
             raise HTTPException(status_code=400, detail="Unsupported file type.")
@@ -215,7 +240,7 @@ def upload_document(
             raise HTTPException(status_code=400, detail="Uploaded file is empty.")
         filename = file.filename or "uploaded.txt"
         print(f"[DEBUG] Creating document: {filename}")
-        user_id = int(user.id)
+        user_id = user.id  # user.id is already the correct type for DB queries
         if not isinstance(user_id, int):
             raise HTTPException(status_code=500, detail="User ID is invalid")
         doc = crud.create_document(db, filename, content, user_id)
@@ -224,13 +249,34 @@ def upload_document(
         chunk_size = 500
         chunks = [content[i:i+chunk_size] for i in range(0, len(content), chunk_size)]
         print(f"[DEBUG] Number of chunks: {len(chunks)}")
-        embeddings = model.encode(chunks)
-        print("[DEBUG] Embeddings generated")
-        doc_id = int(doc.id)
-        if not isinstance(doc_id, int):
+        # Fix: Add error handling, type checks, and ensure embeddings and chunks match
+        try:
+            embeddings = model.encode(chunks)
+            print("[DEBUG] Embeddings generated")
+        except Exception as e:
+            print(f"[DEBUG] Embedding generation failed: {e}")
+            raise HTTPException(status_code=500, detail="Failed to generate embeddings.")
+
+        doc_id = getattr(doc, "id", None)
+        if doc_id is None or not isinstance(doc_id, int):
+            print("[DEBUG] Invalid document ID")
             raise HTTPException(status_code=500, detail="Document ID is invalid")
+
+        if not isinstance(embeddings, (list, np.ndarray)) or len(embeddings) != len(chunks):
+            print("[DEBUG] Embeddings and chunks length mismatch")
+            raise HTTPException(status_code=500, detail="Embedding and chunk count mismatch.")
+
         for i, (chunk_text, embedding) in enumerate(zip(chunks, embeddings)):
-            chunk = crud.create_document_chunk(db, doc_id, chunk_text, np.array(embedding).tobytes())
+            try:
+                chunk = crud.create_document_chunk(
+                    db,
+                    doc_id,
+                    chunk_text,
+                    np.array(embedding).tobytes()
+                )
+            except Exception as e:
+                print(f"[DEBUG] Failed to create chunk {i+1}: {e}")
+                raise HTTPException(status_code=500, detail=f"Failed to create document chunk {i+1}.")
             print(f"[DEBUG] Created chunk {i+1}/{len(chunks)} with id: {chunk.id}")
         print("[DEBUG] All chunks stored")
         chat = crud.create_chat(db, doc_id)
@@ -262,7 +308,13 @@ async def upload_link(
         if not user:
             raise HTTPException(status_code=401, detail="Invalid user")
         # Restrict to 3 documents per user
-        user_id = int(user.id)
+        user_id = getattr(user, "id", None)
+        if user_id is None:
+            raise HTTPException(status_code=500, detail="User ID is missing")
+        try:
+            user_id = int(user_id)
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=500, detail="User ID is invalid")
         user_documents = crud.get_documents_by_user(db, user_id)
         if len(user_documents) >= 3:
             raise HTTPException(status_code=400, detail="You can only upload up to 3 documents. Delete existing documents to upload new ones.")
@@ -275,11 +327,14 @@ async def upload_link(
             raise HTTPException(status_code=400, detail=f"Failed to fetch URL: {e}")
         # Extract main content using readability-lxml and BeautifulSoup
         try:
+            if ReadabilityDocument is None:
+                raise HTTPException(status_code=500, detail="readability-lxml is not installed on the server.")
             doc = ReadabilityDocument(html)
-            main_html = doc.summary()
+            main_html = doc.summary() if doc else ""
+            if not main_html:
+                raise HTTPException(status_code=400, detail="Could not extract main content from the webpage.")
             soup_main = BeautifulSoup(main_html, "html.parser")
             main_content = soup_main.get_text(separator="\n", strip=True)
-            # Fallback: extract all visible text from the full HTML
             soup_full = BeautifulSoup(html, "html.parser")
             full_content = soup_full.get_text(separator="\n", strip=True)
             # Merge main and full content, remove duplicates
@@ -296,15 +351,29 @@ async def upload_link(
             raise HTTPException(status_code=400, detail="Extracted content is too short or empty. The website may not be supported.")
         if len(content) > 20000:
             content = content[:20000]  # Limit to 20,000 characters
-        filename = url
-        user_id = int(user.id)
-        # Store as a document with fileType 'link'
-        doc = crud.create_document(db, filename, content, user_id)
-        # --- RAG: Chunk and embed document ---
-        chunk_size = 500
+            filename = url
+            # Ensure user.id is a plain int, not a SQLAlchemy column/expression
+            user_id = getattr(user, "id", None)
+            if user_id is None:
+                raise HTTPException(status_code=500, detail="User ID is missing")
+            try:
+                user_id = int(user_id)
+            except (TypeError, ValueError):
+                raise HTTPException(status_code=500, detail="User ID is invalid")
+            # Store as a document with fileType 'link'
+            doc = crud.create_document(db, filename, content, user_id)
+            # --- RAG: Chunk and embed document ---
+            chunk_size = 500
         chunks = [content[i:i+chunk_size] for i in range(0, len(content), chunk_size)]
         embeddings = model.encode(chunks)
-        doc_id = int(doc.id)
+        # Ensure doc.id is a plain int, not a SQLAlchemy column/expression
+        doc_id = getattr(doc, "id", None)
+        if doc_id is None:
+            raise HTTPException(status_code=500, detail="Document ID is missing")
+        try:
+            doc_id = int(doc_id)
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=500, detail="Document ID is invalid")
         for i, (chunk_text, embedding) in enumerate(zip(chunks, embeddings)):
             chunk = crud.create_document_chunk(db, doc_id, chunk_text, np.array(embedding).tobytes())
         chat = crud.create_chat(db, doc_id)
@@ -317,21 +386,23 @@ async def upload_link(
 # List all documents for the authenticated user
 @app.get("/api/documents", response_model=list[schemas.DocumentOut])
 def list_documents(db: Session = Depends(get_db), token: str = Depends(oauth2_scheme)):
+    payload = jwt.decode(token, auth.SECRET_KEY, algorithms=[auth.ALGORITHM])
+    username = payload.get("sub")
+    if not username:
+        raise HTTPException(status_code=401, detail="Invalid user")
+    user = crud.get_user_by_username(db, username)
+    if not user:
+        raise HTTPException(status_code=401, detail="Invalid user")
+    # Ensure user.id is a plain int, not a SQLAlchemy column/expression
+    user_id = getattr(user, "id", None)
+    if user_id is None:
+        raise HTTPException(status_code=500, detail="User ID is missing")
     try:
-        payload = jwt.decode(token, auth.SECRET_KEY, algorithms=[auth.ALGORITHM])
-        username = payload.get("sub")
-        if not username:
-            raise HTTPException(status_code=401, detail="Invalid user")
-        user = crud.get_user_by_username(db, username)
-        if not user:
-            raise HTTPException(status_code=401, detail="Invalid user")
-        # Ensure user.id is an int, not a SQLAlchemy column or expression
-        user_id = int(user.id)
-        if not isinstance(user_id, int):
-            raise HTTPException(status_code=500, detail="User ID is invalid")
-        return crud.get_documents_by_user(db, user_id)
-    except JWTError:
-        raise HTTPException(status_code=401, detail="Invalid or expired token")
+        user_id = int(user_id)
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=500, detail="User ID is invalid")
+    documents = crud.get_documents_by_user(db, user_id)
+    return documents or []
 @app.get("/api/documents/{document_id}", response_model=schemas.DocumentOut)
 def get_document(document_id: int, db: Session = Depends(get_db), token: str = Depends(oauth2_scheme)):
     try:
@@ -388,8 +459,8 @@ async def ask_question(document_id: int, req: schemas.QuestionRequest, db: Sessi
             raise HTTPException(status_code=404, detail="Document not found")
         if getattr(doc, "owner_id", None) != getattr(user, "id", None):
             raise HTTPException(status_code=403, detail="Not authorized to access this document")
-        answer = await gemini.ask_gemini(getattr(doc, "content", ""), req.question)
-        return {"answer": answer}
+        gemini_result = await gemini.ask_gemini(getattr(doc, "content", ""), req.question)
+        return {"answer": gemini_result["answer"], "followup_questions": gemini_result["followup_questions"]}
     except JWTError:
         raise HTTPException(status_code=401, detail="Invalid or expired token")
 
@@ -408,31 +479,31 @@ async def ask_document_question(
         user = crud.get_user_by_username(db, username)
         if not user:
             raise HTTPException(status_code=401, detail="Invalid user")
-        user_id = int(user.id)
+        user_id = getattr(user, "id", None)
+        if user_id is None:
+            raise HTTPException(status_code=500, detail="User ID is invalid")
         print(f"[DEBUG] Looking for document {document_id} owned by user {user_id}")
-        document = db.query(models.Document).filter(models.Document.id == document_id, models.Document.owner_id == user_id).first()
+        document = db.query(models.Document).filter(
+            models.Document.id == document_id,
+            models.Document.owner_id == user_id
+        ).first()
         if not document:
             print(f"[DEBUG] Document {document_id} not found or not owned by user {user_id}")
             raise HTTPException(status_code=404, detail="Document not found")
         # --- RAG retrieval ---
-        doc_id = int(document.id)
+        doc_id = document.id  # document.id should already be an int
         if not isinstance(doc_id, int):
             raise HTTPException(status_code=500, detail="Document ID is invalid")
-        
         chunks = crud.get_chunks_by_document(db, doc_id)
         debug_info = f"Retrieved {len(chunks)} chunks for document {doc_id}"
         print(f"[DEBUG] {debug_info}")
         if not chunks:
             debug_info += "\nNo chunks found in database"
             print("[DEBUG] No chunks found in database")
-            return {"answer": f"No information available. Debug: {debug_info}"}
-        
-        # Detect summary request (more flexible)
+            return {"answer": f"No information available. Debug: {debug_info}", "followup_questions": []}
         q_lower = question.lower()
         is_summary = ("summary" in q_lower) or ("summar" in q_lower)
-        
         if is_summary:
-            # Send all (or up to 20) chunks for summary
             context_parts = [getattr(chunk, "chunk_text", "") for chunk in chunks[:20]]
             context = "\n".join(context_parts)
             debug_info += f"\n[SUMMARY MODE] Sent {len(context_parts)} chunks for summary."
@@ -449,7 +520,6 @@ async def ask_document_question(
                     except Exception:
                         chunk_emb = np.frombuffer(bytes(embedding), dtype=np.float32)
                     chunk_embs.append(chunk_emb)
-
             sims = cosine_similarity([question_emb], chunk_embs)[0]
             debug_info += f"\nSimilarity scores: {sims}"
             debug_info += f"\nMax similarity score: {np.max(sims)}"
@@ -462,11 +532,9 @@ async def ask_document_question(
             debug_info += f"\nTop chunk scores: {[sims[i] for i in top_indices]}"
             print(f"[DEBUG] Top chunk indices: {top_indices}")
             print(f"[DEBUG] Top chunk scores: {[sims[i] for i in top_indices]}")
-            # Lower the threshold to 0.01 to be even more permissive
             top_chunks = [chunks[i] for i in top_indices if sims[i] > 0.01]
             debug_info += f"\nChunks above threshold (0.01): {len(top_chunks)}"
             print(f"[DEBUG] Chunks above threshold (0.01): {len(top_chunks)}")
-            # Always use at least the top 10 chunk(s) even if below threshold
             if not top_chunks:
                 debug_info += "\nNo chunks above threshold. Using top 10 chunks regardless of score."
                 print("[DEBUG] No chunks above threshold. Using top 10 chunks regardless of score.")
@@ -474,7 +542,7 @@ async def ask_document_question(
                 if not top_chunks:
                     debug_info += "\nStill no chunks available."
                     print("[DEBUG] Still no chunks available. Returning no information.")
-                    return {"answer": f"No information available. Debug: {debug_info}"}
+                    return {"answer": f"No information available. Debug: {debug_info}", "followup_questions": []}
             context_parts = []
             for chunk in top_chunks:
                 chunk_text = getattr(chunk, "chunk_text", None)
@@ -490,9 +558,8 @@ async def ask_document_question(
             debug_info += f"\nContext length: {len(context)}"
             debug_info += f"\nContext preview: {context[:200]}..."
             print(f"[DEBUG] Context sent to Gemini (first 500 chars): {context[:500]}")
-        answer = await gemini.ask_gemini(context, question)
-        # Clean up the answer - ensure it is always a string
-        return {"answer": str(answer).strip()}
+        gemini_result = await gemini.ask_gemini(context, question)
+        return {"answer": gemini_result["answer"], "followup_questions": gemini_result["followup_questions"]}
     except JWTError:
         raise HTTPException(status_code=401, detail="Invalid or expired token")
     except Exception as e:

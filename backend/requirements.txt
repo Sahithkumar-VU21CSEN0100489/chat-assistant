@@ -16,3 +16,4 @@ beautifulsoup4
 python-docx
 readability-lxml
 requests
+jspdf
