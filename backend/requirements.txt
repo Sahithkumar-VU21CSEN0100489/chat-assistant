@@ -1,0 +1,18 @@
+fastapi
+uvicorn
+python-dotenv
+sqlalchemy
+passlib[bcrypt]
+python-jose[cryptography]
+aiofiles
+httpx 
+sentence-transformers
+numpy
+scikit-learn 
+pydantic[email]
+PyPDF2
+# Additional dependencies required by backend/main.py
+beautifulsoup4
+python-docx
+readability-lxml
+requests
